@@ -14,12 +14,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from engine.analytics import (
     calculate_cagr,
+    calculate_cumulative_return,
+    calculate_annualized_return,
     calculate_volatility,
     calculate_max_drawdown,
     calculate_sharpe_ratio,
     calculate_sortino_ratio,
     calculate_beta_alpha,
+    calculate_tracking_error,
+    calculate_correlation,
     rolling_returns,
+    consistency_score,
+    detect_index_like_behavior,
     daily_returns,
 )
 
@@ -64,6 +70,19 @@ class TestVolatility:
 
     def test_empty(self):
         assert calculate_volatility(pd.Series(dtype=float)) is None
+
+
+class TestReturnMetrics:
+    def test_cumulative_return(self):
+        nav = pd.Series([100.0, 110.0], index=pd.bdate_range("2023-01-01", periods=2))
+        assert calculate_cumulative_return(nav) == pytest.approx(0.10, abs=1e-6)
+
+    def test_annualized_return(self):
+        dates = pd.to_datetime(["2020-01-01", "2021-01-01"])
+        nav = pd.Series([100.0, 121.0], index=dates)
+        ann = calculate_annualized_return(nav)
+        assert ann is not None
+        assert ann == pytest.approx(0.21, abs=1e-2)
 
 
 class TestMaxDrawdown:
@@ -113,6 +132,15 @@ class TestBetaAlpha:
         assert beta is None
         assert alpha is None
 
+    def test_tracking_and_correlation(self):
+        nav = make_nav(0.12, 5, 0.15)
+        te = calculate_tracking_error(nav, nav)
+        corr = calculate_correlation(nav, nav)
+        assert te is not None
+        assert te == pytest.approx(0.0, abs=1e-6)
+        assert corr is not None
+        assert corr == pytest.approx(1.0, abs=1e-6)
+
 
 class TestRollingReturns:
     def test_returns_series(self):
@@ -125,6 +153,20 @@ class TestRollingReturns:
         nav  = make_nav(0.12, 1)
         roll = rolling_returns(nav, 3)
         assert roll.empty
+
+
+class TestConsistencyAndIndexLike:
+    def test_consistency_score_bounds(self):
+        nav = make_nav(0.13, 5, 0.14)
+        bench = make_nav(0.12, 5, 0.15)
+        score = consistency_score(nav, bench, 1)
+        assert score is not None
+        assert 0 <= score <= 100
+
+    def test_index_like_flag(self):
+        nav = make_nav(0.12, 5, 0.15)
+        result = detect_index_like_behavior(nav, nav, tracking_error_threshold=0.001, correlation_threshold=0.99)
+        assert result["index_like"] is True
 
 
 if __name__ == "__main__":

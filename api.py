@@ -42,9 +42,15 @@ from engine.analytics import (
     load_all_funds, load_fund_info, load_nav, load_benchmark,
     compute_fund_analytics, compute_benchmark_analytics,
     detect_underperformance, portfolio_analytics,
-    rolling_returns, calculate_overlap,
+    rolling_returns, calculate_overlap, fund_data_quality, fund_decision_card,
 )
 from engine.exit_strategy import assess_exit, find_replacement_funds
+from engine.comparison import (
+    fund_vs_fund,
+    fund_vs_benchmark,
+    fund_vs_category_average,
+    rank_funds_by_category,
+)
 from pipeline.ingest import seed_demo_data
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -332,6 +338,49 @@ def get_underperformance(fund_id: str):
 # FUND COMPARISON
 # ══════════════════════════════════════════════════════════════════════════════
 
+@app.get("/api/funds/{fund_id}/decision")
+def get_fund_decision_card(
+    fund_id: str,
+    holding_months: int = Query(24, ge=1, le=360),
+    invested_amount: float = Query(50000, ge=0),
+):
+    """Single-card decision summary for retail investor action."""
+    result = fund_decision_card(fund_id, holding_months=holding_months, invested_amount=invested_amount)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return _safe(result)
+
+
+@app.get("/api/funds/{fund_id}/data-quality")
+def get_fund_data_quality(fund_id: str):
+    """Data quality & freshness diagnostics for one fund."""
+    return _safe(fund_data_quality(fund_id))
+
+
+@app.get("/api/comparison/fund-vs-benchmark")
+def api_fund_vs_benchmark(fund_id: str = Query(...)):
+    result = fund_vs_benchmark(fund_id)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return _safe(result)
+
+
+@app.get("/api/comparison/fund-vs-category")
+def api_fund_vs_category(fund_id: str = Query(...)):
+    result = fund_vs_category_average(fund_id)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return _safe(result)
+
+
+@app.get("/api/comparison/category-ranking")
+def api_category_ranking(category: str = Query(...), top_n: int = Query(10, ge=1, le=50)):
+    result = rank_funds_by_category(category, top_n=top_n)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return _safe(result)
+
+
 @app.get("/api/comparison")
 def compare_funds(
     fund_a: str = Query(..., description="Fund ID A"),
@@ -412,6 +461,7 @@ def compare_funds(
         "nav_chart": chart,
         "comparison_table": comparison_table,
         "overlap": _safe(overlap),
+        "structured": _safe(fund_vs_fund(fund_a, fund_b)),
     }
 
 
@@ -821,6 +871,7 @@ def screen_funds(
     sharpe_min:    float = Query(0.0),
     er_max:        float = Query(3.0),
     flag:          Optional[str]  = None,
+    preset:        Optional[str] = Query(None, description="beginner|conservative|aggressive"),
     sort_by:       str  = Query("return_5y", description="return_5y|sharpe_ratio|quality_score|alpha"),
     limit:         int  = Query(50, ge=1, le=200),
 ):
@@ -829,6 +880,27 @@ def screen_funds(
     Combine category, risk band, return threshold, expense ratio, underperf flag.
     """
     all_f = load_all_funds()
+
+    # Presets for faster retail workflows
+    if preset:
+        p = preset.lower()
+        if p == "beginner":
+            risk_min, risk_max = 1, 6
+            return_5y_min = max(return_5y_min, 0.08)
+            sharpe_min = max(sharpe_min, 0.6)
+            er_max = min(er_max, 1.5)
+            flag = flag or "OK"
+        elif p == "conservative":
+            risk_min, risk_max = 1, 4
+            return_5y_min = max(return_5y_min, 0.06)
+            sharpe_min = max(sharpe_min, 0.7)
+            er_max = min(er_max, 1.0)
+            flag = flag or "OK"
+        elif p == "aggressive":
+            risk_min, risk_max = 5, 9
+            return_5y_min = max(return_5y_min, 0.10)
+            sharpe_min = max(sharpe_min, 0.4)
+            er_max = min(er_max, 2.2)
 
     # Apply filters
     if category:
@@ -886,7 +958,7 @@ def screen_funds(
     return {
         "total":   len(results),
         "filters": {"category": category, "risk_min": risk_min, "risk_max": risk_max,
-                    "return_5y_min": return_5y_min, "er_max": er_max, "flag": flag},
+                    "return_5y_min": return_5y_min, "er_max": er_max, "flag": flag, "preset": preset},
         "funds":   results[:limit],
     }
 
