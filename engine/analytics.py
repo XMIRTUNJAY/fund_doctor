@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, List
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from database.db import get_connection
+import database.db as db
 
 TRADING_DAYS = 252
 RISK_FREE_RATE = 0.065  # 6.5% — approximate Indian 91-day T-bill rate
@@ -25,7 +25,7 @@ RISK_FREE_RATE = 0.065  # 6.5% — approximate Indian 91-day T-bill rate
 
 def load_nav(fund_id: str, start: str = None, end: str = None) -> pd.Series:
     """Load NAV history as a date-indexed Series."""
-    conn = get_connection()
+    conn = db.get_connection()
     query = "SELECT date, nav FROM nav_history WHERE fund_id = ?"
     params = [fund_id]
     if start:
@@ -49,7 +49,7 @@ def load_nav(fund_id: str, start: str = None, end: str = None) -> pd.Series:
 
 def load_benchmark(index_name: str, start: str = None, end: str = None) -> pd.Series:
     """Load benchmark index values as a date-indexed Series."""
-    conn = get_connection()
+    conn = db.get_connection()
     query = "SELECT date, index_value FROM benchmark_history WHERE index_name = ?"
     params = [index_name]
     if start:
@@ -73,7 +73,7 @@ def load_benchmark(index_name: str, start: str = None, end: str = None) -> pd.Se
 
 def load_fund_info(fund_id: str) -> dict:
     """Load fund metadata from fund_master."""
-    conn = get_connection()
+    conn = db.get_connection()
     row = conn.execute(
         "SELECT * FROM fund_master WHERE fund_id = ?", (fund_id,)
     ).fetchone()
@@ -83,7 +83,7 @@ def load_fund_info(fund_id: str) -> dict:
 
 def load_all_funds() -> pd.DataFrame:
     """Load all funds from fund_master."""
-    conn = get_connection()
+    conn = db.get_connection()
     df = pd.read_sql_query("SELECT * FROM fund_master ORDER BY fund_name", conn)
     conn.close()
     return df
@@ -123,7 +123,33 @@ def calculate_absolute_return(nav: pd.Series) -> Optional[float]:
 
 def daily_returns(nav: pd.Series) -> pd.Series:
     """Compute daily percentage returns."""
+    if nav is None or len(nav) < 2:
+        return pd.Series(dtype=float)
     return nav.pct_change().dropna()
+
+
+def calculate_cumulative_return(nav: pd.Series) -> Optional[float]:
+    """Cumulative return between first and latest point."""
+    if nav is None or len(nav) < 2:
+        return None
+    start_val = nav.iloc[0]
+    if start_val <= 0:
+        return None
+    return float(nav.iloc[-1] / start_val - 1)
+
+
+def calculate_annualized_return(nav: pd.Series) -> Optional[float]:
+    """Annualised return computed from total return and elapsed calendar days."""
+    if nav is None or len(nav) < 2:
+        return None
+    start_val = nav.iloc[0]
+    if start_val <= 0:
+        return None
+    days = (nav.index[-1] - nav.index[0]).days
+    if days <= 0:
+        return None
+    years = days / 365.25
+    return float((nav.iloc[-1] / start_val) ** (1 / years) - 1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -205,6 +231,35 @@ def calculate_beta_alpha(
     return float(beta), float(alpha)
 
 
+def calculate_correlation(nav: pd.Series, benchmark: pd.Series) -> Optional[float]:
+    """Daily return correlation between fund and benchmark."""
+    if nav.empty or benchmark.empty:
+        return None
+    combined = pd.DataFrame({"fund": nav, "bench": benchmark}).dropna()
+    if len(combined) < 30:
+        return None
+    ret = combined.pct_change().dropna()
+    if ret.empty:
+        return None
+    return float(ret["fund"].corr(ret["bench"]))
+
+
+def calculate_tracking_error(nav: pd.Series, benchmark: pd.Series) -> Optional[float]:
+    """Annualised tracking error as std-dev of active return series."""
+    if nav.empty or benchmark.empty:
+        return None
+    combined = pd.DataFrame({"fund": nav, "bench": benchmark}).dropna()
+    if len(combined) < 30:
+        return None
+    ret = combined.pct_change().dropna()
+    if ret.empty:
+        return None
+    active_ret = ret["fund"] - ret["bench"]
+    if active_ret.empty:
+        return None
+    return float(active_ret.std() * np.sqrt(TRADING_DAYS))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Rolling returns
 # ══════════════════════════════════════════════════════════════════════════════
@@ -220,6 +275,44 @@ def rolling_returns(nav: pd.Series, window_years: int = 1) -> pd.Series:
 
     roll = (nav / nav.shift(window_days)) ** (1 / window_years) - 1
     return roll.dropna()
+
+
+def consistency_score(nav: pd.Series, benchmark: pd.Series, window_years: int = 1) -> Optional[float]:
+    """
+    Consistency score (%): percentage of rolling windows where fund beats benchmark.
+    """
+    fund_roll = rolling_returns(nav, window_years)
+    bench_roll = rolling_returns(benchmark, window_years)
+    if fund_roll.empty or bench_roll.empty:
+        return None
+    aligned = pd.DataFrame({"fund": fund_roll, "bench": bench_roll}).dropna()
+    if aligned.empty:
+        return None
+    return float((aligned["fund"] > aligned["bench"]).mean() * 100)
+
+
+def detect_index_like_behavior(
+    nav: pd.Series,
+    benchmark: pd.Series,
+    tracking_error_threshold: float = 0.03,
+    correlation_threshold: float = 0.95,
+) -> dict:
+    """Flag active funds that behave like benchmark despite active-fee profile."""
+    te = calculate_tracking_error(nav, benchmark)
+    corr = calculate_correlation(nav, benchmark)
+    beta, _ = calculate_beta_alpha(nav, benchmark)
+    is_index_like = (
+        te is not None and corr is not None
+        and te < tracking_error_threshold
+        and corr > correlation_threshold
+    )
+    return {
+        "tracking_error": te,
+        "correlation": corr,
+        "beta": beta,
+        "index_like": bool(is_index_like),
+        "label": "Index-like fund with active fees" if is_index_like else "Distinct active behavior",
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -240,6 +333,12 @@ def compute_fund_analytics(fund_id: str) -> dict:
     bench = load_benchmark(benchmark_name)
 
     beta, alpha = calculate_beta_alpha(nav, bench)
+    corr = calculate_correlation(nav, bench)
+    te = calculate_tracking_error(nav, bench)
+    consistency_1y = consistency_score(nav, bench, 1)
+    consistency_3y = consistency_score(nav, bench, 3)
+    consistency_5y = consistency_score(nav, bench, 5)
+    index_like = detect_index_like_behavior(nav, bench)
 
     result = {
         "fund_id":          fund_id,
@@ -253,12 +352,21 @@ def compute_fund_analytics(fund_id: str) -> dict:
         "return_5y":        calculate_cagr(nav, 5),
         "return_10y":       calculate_cagr(nav, 10),
         "return_inception": calculate_absolute_return(nav),
+        "cumulative_return": calculate_cumulative_return(nav),
+        "annualized_return": calculate_annualized_return(nav),
         "volatility":       calculate_volatility(nav),
         "max_drawdown":     calculate_max_drawdown(nav),
         "sharpe_ratio":     calculate_sharpe_ratio(nav),
         "sortino_ratio":    calculate_sortino_ratio(nav),
         "beta":             beta,
         "alpha":            alpha,
+        "correlation":      corr,
+        "tracking_error":   te,
+        "consistency_1y":   consistency_1y,
+        "consistency_3y":   consistency_3y,
+        "consistency_5y":   consistency_5y,
+        "index_like_label": index_like["label"],
+        "is_index_like":    index_like["index_like"],
         "nav_latest":       float(nav.iloc[-1]),
         "nav_start_date":   str(nav.index.min().date()),
         "nav_end_date":     str(nav.index.max().date()),
@@ -367,7 +475,7 @@ def detect_underperformance(fund_id: str) -> dict:
 
 def calculate_overlap(fund_id_a: str, fund_id_b: str) -> dict:
     """Compute holdings overlap between two funds."""
-    conn = get_connection()
+    conn = db.get_connection()
 
     def get_holdings(fid):
         df = pd.read_sql_query(
@@ -395,6 +503,122 @@ def calculate_overlap(fund_id_a: str, fund_id_b: str) -> dict:
     }
 
 
+def fund_data_quality(fund_id: str, min_history_years: float = 3.0) -> dict:
+    """Assess data completeness/freshness for a single fund."""
+    nav = load_nav(fund_id)
+    info = load_fund_info(fund_id)
+    if nav.empty:
+        return {
+            "fund_id": fund_id,
+            "fund_name": info.get("fund_name", fund_id),
+            "quality_score": 0,
+            "status": "LOW",
+            "freshness_days": None,
+            "history_years": 0.0,
+            "nav_points": 0,
+            "benchmark_aligned_ratio": 0.0,
+            "issues": ["No NAV history"],
+        }
+
+    latest_date = nav.index.max()
+    earliest_date = nav.index.min()
+    freshness_days = int((pd.Timestamp.today().normalize() - latest_date.normalize()).days)
+    history_years = max(0.0, (latest_date - earliest_date).days / 365.25)
+
+    benchmark = load_benchmark(info.get("benchmark", "Nifty 50"))
+    if benchmark.empty:
+        aligned_ratio = 0.0
+    else:
+        aligned = pd.DataFrame({"fund": nav, "bench": benchmark}).dropna()
+        aligned_ratio = float(len(aligned) / len(nav)) if len(nav) > 0 else 0.0
+
+    issues = []
+    if freshness_days > 7:
+        issues.append(f"Stale NAV data ({freshness_days} days)")
+    if history_years < min_history_years:
+        issues.append(f"Short history ({history_years:.1f} years)")
+    if aligned_ratio < 0.7:
+        issues.append(f"Low benchmark overlap ({aligned_ratio:.0%})")
+
+    # score components
+    freshness_score = max(0.0, 100 - min(100, freshness_days * 4))
+    history_score = min(100.0, (history_years / min_history_years) * 100)
+    align_score = min(100.0, aligned_ratio * 100)
+    quality_score = round(0.4 * freshness_score + 0.35 * history_score + 0.25 * align_score)
+
+    status = "HIGH" if quality_score >= 75 else ("MEDIUM" if quality_score >= 50 else "LOW")
+
+    return {
+        "fund_id": fund_id,
+        "fund_name": info.get("fund_name", fund_id),
+        "quality_score": quality_score,
+        "status": status,
+        "freshness_days": freshness_days,
+        "history_years": round(history_years, 2),
+        "nav_points": int(len(nav)),
+        "benchmark_aligned_ratio": round(aligned_ratio, 3),
+        "issues": issues,
+    }
+
+
+def fund_decision_card(fund_id: str, holding_months: int = 24, invested_amount: float = 50000) -> dict:
+    """Single-card decision summary combining performance, risk, exits and data quality."""
+    analytics = compute_fund_analytics(fund_id)
+    if "error" in analytics:
+        return {"fund_id": fund_id, "error": analytics["error"]}
+
+    up = detect_underperformance(fund_id)
+    from engine.exit_strategy import assess_exit
+    exit_assessment = assess_exit(fund_id, holding_months=holding_months, invested_amount=invested_amount)
+    quality = fund_data_quality(fund_id)
+
+    score = 50.0
+    score += (analytics.get("return_5y") or 0) * 120
+    score += (analytics.get("sharpe_ratio") or 0) * 10
+    score += (analytics.get("consistency_3y") or 0) * 0.2
+    score -= abs(analytics.get("max_drawdown") or 0) * 50
+    score -= (analytics.get("expense_ratio") or 0.8) * 4
+
+    penalties = {"OK": 0, "WARNING": 8, "SERIOUS": 15, "CRITICAL": 25}
+    score -= penalties.get(up.get("flag", "OK"), 10)
+    score += (quality.get("quality_score", 50) - 50) * 0.25
+
+    final_score = max(0, min(100, round(score)))
+    grade = "A" if final_score >= 80 else ("B" if final_score >= 65 else ("C" if final_score >= 50 else "D"))
+
+    verdict_map = {
+        "A": "STRONG_HOLD",
+        "B": "HOLD",
+        "C": "WATCH",
+        "D": "REVIEW_EXIT",
+    }
+
+    return {
+        "fund_id": fund_id,
+        "fund_name": analytics.get("fund_name", fund_id),
+        "grade": grade,
+        "decision_score": final_score,
+        "verdict": verdict_map[grade],
+        "underperformance_flag": up.get("flag", "NO_DATA"),
+        "exit_recommendation": exit_assessment.get("recommendation"),
+        "data_quality": quality,
+        "key_metrics": {
+            "return_5y": analytics.get("return_5y"),
+            "sharpe_ratio": analytics.get("sharpe_ratio"),
+            "max_drawdown": analytics.get("max_drawdown"),
+            "consistency_3y": analytics.get("consistency_3y"),
+            "expense_ratio": analytics.get("expense_ratio"),
+        },
+        "why": [
+            f"5Y return: {analytics.get('return_5y'):.2%}" if analytics.get('return_5y') is not None else "5Y return unavailable",
+            f"Sharpe ratio: {analytics.get('sharpe_ratio'):.2f}" if analytics.get('sharpe_ratio') is not None else "Sharpe unavailable",
+            f"Underperformance flag: {up.get('flag', 'NO_DATA')}",
+            f"Data quality: {quality.get('status')} ({quality.get('quality_score')}/100)",
+        ],
+    }
+
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Portfolio analytics
 # ══════════════════════════════════════════════════════════════════════════════
@@ -404,7 +628,7 @@ def portfolio_analytics(user_id: str = "default") -> dict:
     Full portfolio health analysis for a user.
     Returns a health score (0–100) and recommendations.
     """
-    conn = get_connection()
+    conn = db.get_connection()
     portfolio = pd.read_sql_query("""
         SELECT p.fund_id, p.amount_invested, p.purchase_date, p.purchase_nav,
                f.fund_name, f.category, f.expense_ratio, f.benchmark
@@ -438,6 +662,25 @@ def portfolio_analytics(user_id: str = "default") -> dict:
     portfolio["current_value"] = current_values
     total_current = sum(current_values)
 
+    # Portfolio-level return/risk using weighted daily returns
+    weighted_returns = []
+    for _, row in portfolio.iterrows():
+        nav = load_nav(row["fund_id"])
+        ret = daily_returns(nav)
+        if ret.empty or total_current <= 0:
+            continue
+        weight = row["current_value"] / total_current
+        weighted_returns.append(ret.rename(row["fund_id"]) * weight)
+
+    if weighted_returns:
+        returns_df = pd.concat(weighted_returns, axis=1).fillna(0.0)
+        portfolio_daily = returns_df.sum(axis=1)
+        portfolio_return_annual = float((1 + portfolio_daily.mean()) ** TRADING_DAYS - 1)
+        portfolio_volatility = float(portfolio_daily.std() * np.sqrt(TRADING_DAYS))
+    else:
+        portfolio_return_annual = None
+        portfolio_volatility = None
+
     # Category allocation
     cat_alloc = (
         portfolio.groupby("category")["current_value"]
@@ -465,6 +708,7 @@ def portfolio_analytics(user_id: str = "default") -> dict:
     # Diversification score (0–100)
     n_categories = len(cat_alloc)
     top_cat_pct  = float(cat_alloc.iloc[0]) if len(cat_alloc) > 0 else 1.0
+    concentration_risk = top_cat_pct
     div_score    = min(100, n_categories * 15 + (1 - top_cat_pct) * 40)
 
     # Penalty for underperformers
@@ -505,10 +749,17 @@ def portfolio_analytics(user_id: str = "default") -> dict:
         "total_gain":     total_current - total_invested,
         "total_gain_pct": (total_current / total_invested - 1) if total_invested > 0 else 0,
         "health_score":   round(health_score),
+        "portfolio_return_annual": portfolio_return_annual,
+        "portfolio_volatility": portfolio_volatility,
+        "concentration_risk": concentration_risk,
         "avg_er":         round(avg_er, 3),
         "n_funds":        len(fund_ids),
         "category_allocation": cat_alloc.to_dict(),
         "underperformance_flags": flags,
         "recommendations": recommendations,
+        "prioritized_actions": sorted([
+            {"action": r, "impact": (90 if "CRITICALLY" in r else 70 if "SERIOUS" in r else 60 if "concentrated" in r else 50)}
+            for r in recommendations
+        ], key=lambda x: x["impact"], reverse=True),
         "portfolio_df":   portfolio,
     }
