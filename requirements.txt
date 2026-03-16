@@ -1,0 +1,11 @@
+pandas==2.1.4
+numpy==1.26.2
+scipy==1.11.4
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
+requests==2.31.0
+python-dotenv==1.0.0
+yfinance==0.2.33
+tqdm==4.66.1
+schedule==1.2.1
+httpx==0.26.0
